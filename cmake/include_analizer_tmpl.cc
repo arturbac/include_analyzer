@@ -127,7 +127,8 @@ struct include_collection_t
     return it_fn->second;
     }
   };
-static void scan_emplace_includes_for_target( include_collection_t & includes,
+static void scan_emplace_includes_for_target( std::ostream & out,
+                                              include_collection_t & includes,
                                               std::string_view include_dir_absoulte_path,
                                               std::vector<include_ref_t> & target_relative_includes )
 {
@@ -142,7 +143,7 @@ static void scan_emplace_includes_for_target( include_collection_t & includes,
         std::string absoulte_path{file_path.string()};
         auto include { includes.insert_or_create(absoulte_path) };
         std::string inc_relative_path{absoulte_path.substr(include_dir_absoulte_path.size()+1)};
-        std::cout << inc_relative_path << '\n';
+        out << " found include :" << inc_relative_path << '\n';
         target_relative_includes.emplace_back( include_ref_t{ include.get(), inc_relative_path});
         }
       }
@@ -161,49 +162,61 @@ static is_circular check_if_is_circular(header_stack_t & header_stack, file_node
   return is_circular::no;
   }
 
-static void report_circular_dependency(header_stack_t & header_stack, target_t const & target,
+static void report_circular_dependency(std::ostream & out,
+                                       header_stack_t & header_stack, target_t const & target,
                                        file_node_t const * include, std::string_view rel_path )
   {
-  std::cout << "\t\tcircular dependency for :" << target.target_name << ":" << rel_path/*include->full_path*/ << std::endl;
+  out << "\t\tcircular dependency for :" << target.target_name << ":" << rel_path/*include->full_path*/ << std::endl;
   for( auto it = std::rbegin(header_stack); std::rend(header_stack) != it; ++it )
     {
-    std::cout << "\t\t\t <-" << it->target->target_name << ":" << it->include_relative_path << std::endl;
+    out << "\t\t\t <-" << it->target->target_name << ":" << it->include_relative_path << std::endl;
     if( it->include == include )
       break;
     }
   }
 
-static void process_source(header_guard_t & header_guard, header_stack_t & header_stack,
-                           file_node_t const * include, std::string_view rel_path, target_t const & target)
+enum struct processing_result_e : bool { failed, succeed };
+
+static processing_result_e process_source(std::ostream & out,
+                                          header_guard_t & header_guard,
+                                          header_stack_t & header_stack,
+                                          file_node_t const * include,
+                                          std::string_view rel_path,
+                                          target_t const & target)
   {
+  auto processing_result { processing_result_e::succeed };
   header_stack.emplace_back( target_include_ref_t{ include, std::string{rel_path}, &target } );
   header_guard.emplace( include );
   
   std::fstream s(include->full_path, std::fstream::in );
-  std::cout << target.target_name << " :" << include->full_path << s.is_open() << std::endl;
+  out << target.target_name << " :" << include->full_path << s.is_open() << std::endl;
   std::string line;
   while (std::getline(s, line))
     {
     std::string_view linev{ line };
-    std::cout << "\t" << line << std::endl;
+//     out << "\t" << line << std::endl;
     auto pos{ linev.find("#include ") };
     if( pos != std::string::npos )
       {
       auto include{ trim(linev.substr(pos+9)) };
-      std::cout << "\t look for " << target.target_name << " -> " << include << std::endl;
+      out << "\t look for " << target.target_name << " -> " << include << std::endl;
       
       //search in own includes in private
       auto fn{ find_include(target.private_includes,include) };
       if( fn )
         {
-        std::cout << "\t\tinclude found in private :" << fn->full_path << std::endl;
+        out << "\t\tinclude found in private :" << fn->full_path << std::endl;
         if(header_guard.end() == header_guard.find(fn))
-          process_source(header_guard,header_stack,fn, include, target );
+          process_source(out, header_guard,header_stack,fn, include, target );
         else
           {
           //check for circular dependency
           if( is_circular::yes == check_if_is_circular(header_stack, fn ))
-            report_circular_dependency(header_stack, target, fn, rel_path);
+            {
+            processing_result = processing_result_e::failed;
+            report_circular_dependency(out, header_stack, target, fn, rel_path);
+            report_circular_dependency(std::cout, header_stack, target, fn, rel_path);
+            }
           }
         }
       else
@@ -214,14 +227,18 @@ static void process_source(header_guard_t & header_guard, header_stack_t & heade
           fn = find_include(ref->interface_includes,include);
           if(fn)
             {
-            std::cout << "\t\tinclude found in referenced :" << ref->target_name << " :" << fn->full_path << std::endl;
+            out << "\t\tinclude found in referenced :" << ref->target_name << " :" << fn->full_path << std::endl;
             if(header_guard.end() == header_guard.find(fn))
-              process_source(header_guard,header_stack,fn, include, *ref );
+              process_source(out, header_guard,header_stack,fn, include, *ref );
             else
               {
               //check for circular dependency
               if( is_circular::yes == check_if_is_circular(header_stack, fn ))
-                report_circular_dependency(header_stack, target, fn, rel_path);
+                {
+                processing_result = processing_result_e::failed;
+                report_circular_dependency(out, header_stack, target, fn, rel_path);
+                report_circular_dependency(std::cout, header_stack, target, fn, rel_path);
+                }
               }
             break;
             }
@@ -231,34 +248,37 @@ static void process_source(header_guard_t & header_guard, header_stack_t & heade
         {}
       else
         {
-        std::cout << "\t\tinclude not found" << std::endl;
+        out << "\t\tinclude not found" << std::endl;
         }
       }
     }
   assert(header_stack.back().include == include);
   header_stack.pop_back();
+  return processing_result;
   }
   
-static bool process_data( std::span<cmake_processed::source_file_t const> targets_sources,
+static processing_result_e process_data( 
+                          std::ostream & out,
+                          std::span<cmake_processed::source_file_t const> targets_sources,
                           std::span<cmake_processed::target_include_t const> targets_include_paths,
                           std::span<cmake_processed::target_include_t const> targets_interface_include_paths,
                           std::span<cmake_processed::target_dependency_t const> target_dependencies )
 {
   target_map_type targets;
   include_collection_t includes;
-  
+  auto result{ processing_result_e::succeed };
   for( auto const & src :  targets_include_paths )
     {
     target_t & target{ targets[src.target_name] };
     target.include_paths.emplace_back(src.include_path);
-    scan_emplace_includes_for_target(includes,src.include_path,target.private_includes);
+    scan_emplace_includes_for_target(out, includes,src.include_path,target.private_includes);
     }
     
   for( auto const & src :  targets_interface_include_paths )
     {
     target_t & target{ targets[src.target_name] };
     target.interface_include_paths.emplace_back(src.include_path);
-    scan_emplace_includes_for_target(includes,src.include_path,target.interface_includes);
+    scan_emplace_includes_for_target(out, includes,src.include_path,target.interface_includes);
     }
     
   for( auto const build_dep : target_dependencies)
@@ -283,36 +303,40 @@ static bool process_data( std::span<cmake_processed::source_file_t const> target
   
     //Building analysis for include and target
     auto include { includes.insert_or_create(std::string{src.source_path}) };
-    process_source(header_guard,header_stack,include.get(), "", target);
+    processing_result_e processing_result
+      { process_source(out,header_guard,header_stack,include.get(), "", target) };
+    if( processing_result == processing_result_e::failed)
+      result = processing_result_e::failed;
+    
     }
     
 //     "node0" [ label = "exec", shape = box ];
 //     "node1" [ label = "libb\n(ia::libb)", shape = box ];
 //     "node1" -> "node2" [ style = dotted ] // libb -> liba
-  return true;
+  return result;
 }
 
 namespace cmake_processed
 {
 static constexpr std::array targets 
   {
-@ANALIZER_TARGETS_DATA@
+@ANALYZER_TARGETS_DATA@
   };
 static constexpr std::array targets_sources 
   {
-@ANALIZER_SOURCES_DATA@
+@ANALYZER_SOURCES_DATA@
   };
 static constexpr std::array targets_include_paths 
   {
-@ANALIZER_INCLUDES_DATA@
+@ANALYZER_INCLUDES_DATA@
   };
 static constexpr std::array targets_interface_include_paths 
   {
-@ANALIZER_INTERFACE_INCLUDES_DATA@
+@ANALYZER_INTERFACE_INCLUDES_DATA@
   };
 static constexpr std::array targets_link_dependency 
   {
-@ANALIZER_LINK_TARGETS_DATA@
+@ANALYZER_LINK_TARGETS_DATA@
   };
 }
 
@@ -320,12 +344,16 @@ static constexpr std::array targets_link_dependency
 
 int main()
   {
+  std::ofstream fout("ia_log.txt");
   using inc_analizer::target_t;
   using inc_analizer::source_t;
   using inc_analizer::target_map_type;
-  
-  inc_analizer::process_data(inc_analizer::cmake_processed::targets_sources,
+  using inc_analizer::processing_result_e;
+  processing_result_e result {
+  inc_analizer::process_data(fout,
+                             inc_analizer::cmake_processed::targets_sources,
                              inc_analizer::cmake_processed::targets_include_paths,
                              inc_analizer::cmake_processed::targets_interface_include_paths,
-                             inc_analizer::cmake_processed::targets_link_dependency);
+                             inc_analizer::cmake_processed::targets_link_dependency) };
+  return processing_result_e::succeed == result ? 0 : 1;
   }
