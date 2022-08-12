@@ -12,8 +12,10 @@ set(CMAKE_CXX_STANDARD 20 )
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 set(CMAKE_CXX_EXTENSIONS OFF )
 
-add_subdirectory(common)
-add_subdirectory(exec)
+if(PROJECT_IS_TOP_LEVEL)
+  add_subdirectory(common)
+  add_subdirectory(exec)
+endif()
 
 include(include_analizer)
 
